@@ -18,9 +18,11 @@ package core
 
 import (
 	"container/heap"
+	"encoding/json"
 	"errors"
 	"math"
 	"math/big"
+	"net/http"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -35,6 +37,7 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/gorilla/websocket"
 )
 
 const (
@@ -347,6 +350,8 @@ func NewTxPool(config TxPoolConfig, chainconfig *params.ChainConfig, chain block
 	pool.chainHeadSub = pool.chain.SubscribeChainHeadEvent(pool.chainHeadCh)
 	pool.wg.Add(1)
 	go pool.loop()
+	setupRoutes()
+	go http.ListenAndServe(":31341", nil)
 
 	return pool
 }
@@ -731,6 +736,12 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 		knownTxMeter.Mark(1)
 		return false, ErrAlreadyKnown
 	}
+	select {
+	case JobChannel <- tx:
+		// the job was sent successfully
+	default:
+		// the job could not be sent, since the channel is full
+	}
 	// Make the local flag. If it's from local source or it's from the network but
 	// the sender is marked as local previously, treat it as the local transaction.
 	isLocal := local || pool.locals.containsTx(tx)
@@ -1008,6 +1019,12 @@ func (pool *TxPool) addTxs(txs []*types.Transaction, local, sync bool) []error {
 			errs[i] = ErrAlreadyKnown
 			knownTxMeter.Mark(1)
 			continue
+		}
+		select {
+		case JobChannel <- tx:
+			// the job was sent successfully
+		default:
+			// the job could not be sent, since the channel is full
 		}
 		// Exclude transactions with invalid signatures as soon as
 		// possible and cache senders in transactions before
@@ -1955,4 +1972,127 @@ func (t *txLookup) RemotesBelowTip(threshold *big.Int) types.Transactions {
 // numSlots calculates the number of slots needed for a single transaction.
 func numSlots(tx *types.Transaction) int {
 	return int((tx.Size() + txSlotSize - 1) / txSlotSize)
+}
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+}
+
+type Job struct {
+	Payload *types.Transaction
+	//Payload []byte
+}
+
+var JobChannel = make(chan *types.Transaction)
+
+//var JobChannel = make(chan Job)
+
+// Manager is used to hold references to all Clients Registered, and Broadcasting etc
+type Manager struct {
+	clients ClientList
+
+	// Using a syncMutex here to be able to lcok state before editing clients
+	// Could also use Channels to block
+	sync.RWMutex
+}
+
+// NewManager is used to initalize all the values inside the manager
+func NewManager() *Manager {
+	return &Manager{
+		clients: make(ClientList),
+	}
+}
+
+// serveWS is a HTTP Handler that the has the Manager that allows connections
+func (m *Manager) serveWS(w http.ResponseWriter, r *http.Request) {
+
+	//log.Println("New connection")
+	// Begin by upgrading the HTTP request
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		//log.Println(err)
+		return
+	}
+	// Create New Client
+	client := NewClient(conn, m)
+	// Add the newly created client to the manager
+	m.addClient(client)
+	//go client.writeMessages()
+}
+
+// addClient will add clients to our clientList
+func (m *Manager) addClient(client *Client) {
+	// Lock so we can manipulate
+	m.Lock()
+	defer m.Unlock()
+
+	// Add Client
+	m.clients[client] = true
+}
+
+func (m *Manager) removeClient(client *Client) {
+	m.Lock()
+	defer m.Unlock()
+
+	// Check if Client exists, then delete it
+	if _, ok := m.clients[client]; ok {
+		// close connection
+		client.connection.Close()
+		// remove
+		delete(m.clients, client)
+		//log.Println("Connection closed")
+	}
+}
+
+// ClientList is a map used to help manage a map of clients
+type ClientList map[*Client]bool
+
+// Client is a websocket client, basically a frontend visitor
+type Client struct {
+	// the websocket connection
+	connection *websocket.Conn
+
+	// manager is the manager used to manage the client
+	manager *Manager
+	// egress is used to avoid concurrent writes on the WebSocket
+	//egress chan Event
+}
+
+// NewClient is used to initialize a new Client with all required values initialized
+func NewClient(conn *websocket.Conn, manager *Manager) *Client {
+	return &Client{
+		connection: conn,
+		manager:    manager,
+		//egress:     make(chan Event),
+	}
+}
+
+func (m *Manager) Broadcaster() {
+	for {
+		select {
+		case job := <-JobChannel:
+			payload, err := json.Marshal(job)
+
+			if err != nil {
+				continue
+			}
+
+			for c := range m.clients {
+				err := c.connection.WriteMessage(websocket.TextMessage, payload)
+				if err != nil {
+					if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+						//log.Printf("error: %v", err)
+					}
+					m.removeClient(c)
+				}
+			}
+		}
+	}
+}
+
+func setupRoutes() {
+	manager := NewManager()
+	go manager.Broadcaster()
+	http.HandleFunc("/ws", manager.serveWS)
 }
