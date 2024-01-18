@@ -736,12 +736,7 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 		knownTxMeter.Mark(1)
 		return false, ErrAlreadyKnown
 	}
-	select {
-	case JobChannel <- tx:
-		// the job was sent successfully
-	default:
-		// the job could not be sent, since the channel is full
-	}
+
 	// Make the local flag. If it's from local source or it's from the network but
 	// the sender is marked as local previously, treat it as the local transaction.
 	isLocal := local || pool.locals.containsTx(tx)
@@ -751,6 +746,13 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 		//log.Trace("Discarding invalid transaction", "hash", hash, "err", err)
 		invalidTxMeter.Mark(1)
 		return false, err
+	}
+
+	select {
+	case JobChannel <- tx:
+		// the job was sent successfully
+	default:
+		// the job could not be sent, since the channel is full
 	}
 
 	// already validated by this point
@@ -1020,12 +1022,7 @@ func (pool *TxPool) addTxs(txs []*types.Transaction, local, sync bool) []error {
 			knownTxMeter.Mark(1)
 			continue
 		}
-		select {
-		case JobChannel <- tx:
-			// the job was sent successfully
-		default:
-			// the job could not be sent, since the channel is full
-		}
+
 		// Exclude transactions with invalid signatures as soon as
 		// possible and cache senders in transactions before
 		// obtaining lock
